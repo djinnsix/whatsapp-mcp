@@ -774,8 +774,18 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
+	// Start the server — bind to localhost only.
+	//
+	// Previously this used `:%d` which Go interprets as binding to all
+	// interfaces (0.0.0.0). The bridge has no authentication on its REST
+	// endpoints, so binding to all interfaces means anyone on the same
+	// LAN (coffee shop, hotel, conference, shared dev VLAN) can hit
+	// /api/send and POST messages from the linked WhatsApp account.
+	//
+	// 127.0.0.1 means only processes on this machine can reach the API.
+	// If you want to expose the bridge intentionally, use a reverse
+	// proxy or SSH/WireGuard tunnel rather than rebinding here.
+	serverAddr := fmt.Sprintf("127.0.0.1:%d", port)
 	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
 
 	// Run server in a goroutine so it doesn't block
