@@ -4,6 +4,9 @@
 *.db
 **/store/
 **/store/**
+# The deployed tool symlinks whatsapp-bridge/store -> ../store; the directory
+# patterns above do not match a symlink, so exclude it by name too.
+whatsapp-bridge/store
 
 # Built binary
 whatsapp-bridge/whatsapp-bridge

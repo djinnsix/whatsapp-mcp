@@ -1,5 +1,5 @@
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from typing import Optional, List, Tuple
 import os.path
@@ -8,7 +8,7 @@ import json
 import audio
 
 MESSAGES_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'whatsapp-bridge', 'store', 'messages.db')
-WHATSAPP_API_BASE_URL = "http://localhost:8080/api"
+WHATSAPP_API_BASE_URL = "http://127.0.0.1:8080/api"
 
 @dataclass
 class Message:
@@ -218,6 +218,57 @@ def list_messages(
     except sqlite3.Error as e:
         print(f"Database error: {e}")
         return []
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+def get_messages_since(chat_jid: str, cursor: Optional[int] = None, limit: int = 100) -> dict:
+    """Cursor-based pagination over a chat's messages, oldest first.
+
+    The cursor is the SQLite rowid of the last message seen; pass the
+    next_cursor from the previous call, or None to start from the oldest
+    stored message. Rowids increase in insert order, so consumers never
+    compare timestamps for pagination. A message stored again by a re-sync
+    gets a fresh rowid and can reappear, so dedupe by id.
+    """
+    try:
+        conn = sqlite3.connect(MESSAGES_DB_PATH)
+        db_cursor = conn.cursor()
+
+        since = cursor if cursor is not None else 0
+        db_cursor.execute("""
+            SELECT messages.rowid, messages.id, messages.chat_jid, messages.sender,
+                   messages.content, messages.timestamp, messages.is_from_me, messages.media_type
+            FROM messages
+            WHERE messages.chat_jid = ? AND messages.rowid > ?
+            ORDER BY messages.rowid ASC
+            LIMIT ?
+        """, (chat_jid, since, limit))
+        rows = db_cursor.fetchall()
+
+        messages = []
+        for row in rows:
+            ts = datetime.fromisoformat(row[5])
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            messages.append({
+                "cursor": row[0],
+                "id": row[1],
+                "chat_jid": row[2],
+                "sender": row[3],
+                "sender_name": get_sender_name(row[3]) if not row[6] else "Me",
+                "content": row[4],
+                "timestamp": ts.astimezone(timezone.utc).isoformat(),
+                "is_from_me": bool(row[6]),
+                "media_type": row[7],
+            })
+
+        next_cursor = messages[-1]["cursor"] if messages else since
+        return {"messages": messages, "next_cursor": next_cursor, "has_more": len(rows) == limit}
+
+    except sqlite3.Error as e:
+        return {"messages": [], "next_cursor": cursor, "has_more": False, "error": str(e)}
     finally:
         if 'conn' in locals():
             conn.close()

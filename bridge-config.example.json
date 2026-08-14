@@ -1,0 +1,27 @@
+{
+  "hooks": [
+    {
+      "jids": ["123456789012345678@g.us"],
+      "webhook_url": "http://127.0.0.1:9090/on-message",
+      "command": ["/absolute/path/to/handle-message.sh"]
+    }
+  ],
+  "send_filter": {
+    "jids": ["123456789012345678@g.us"],
+    "allow_media": false,
+    "patterns": [
+      { "pattern": "AKIA[0-9A-Z]{16}", "description": "AWS access key ID" },
+      { "pattern": "aws_secret_access_key|AWS_SECRET", "description": "AWS secret key reference" },
+      { "pattern": "-----BEGIN( RSA| EC| OPENSSH| PGP)? (PRIVATE|ENCRYPTED)", "description": "private key block" },
+      { "pattern": "eyJ[A-Za-z0-9_-]{30,}\\.[A-Za-z0-9_-]{20,}", "description": "JWT token" },
+      { "pattern": "gh[pousr]_[A-Za-z0-9]{30,}", "description": "GitHub token" },
+      { "pattern": "sk-ant-[A-Za-z0-9-]{20,}", "description": "Anthropic API key" },
+      { "pattern": "sk-[A-Za-z0-9]{40,}", "description": "API secret key" },
+      { "pattern": "xox[bpars]-[A-Za-z0-9-]{10,}", "description": "Slack token" },
+      { "pattern": "(password|passwd|secret|api[_-]?key|token)[[:space:]]*[:=][[:space:]]*[^[:space:]]{8,}", "description": "credential assignment", "case_insensitive": true },
+      { "pattern": "111111111111|222222222222", "description": "known AWS account ID" },
+      { "pattern": "[A-Za-z0-9+/]{40,}={0,2}[[:space:]]|[A-Za-z0-9+/]{60,}", "description": "long high-entropy string" },
+      { "pattern": "customer-one|customer-two", "description": "customer or prospect name", "case_insensitive": true }
+    ]
+  }
+}
