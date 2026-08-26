@@ -90,6 +90,23 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create tables: %v", err)
 	}
 
+	// One-time normalisation: legacy rows were written in local time
+	// (+01:00/+02:00). SQLite compares timestamps as strings, so a mixed
+	// store breaks ordering and "after" filters. Rewrite everything to UTC
+	// with an explicit +00:00 suffix; a no-op once all rows are converted.
+	// New rows are written as UTC (see StoreMessage/StoreChat).
+	for _, stmt := range []string{
+		`UPDATE messages SET timestamp = datetime(timestamp) || '+00:00'
+		 WHERE timestamp NOT LIKE '%+00:00' AND datetime(timestamp) IS NOT NULL`,
+		`UPDATE chats SET last_message_time = datetime(last_message_time) || '+00:00'
+		 WHERE last_message_time NOT LIKE '%+00:00' AND datetime(last_message_time) IS NOT NULL`,
+	} {
+		if _, err := db.Exec(stmt); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("failed to normalise timestamps to UTC: %v", err)
+		}
+	}
+
 	return &MessageStore{db: db}, nil
 }
 
@@ -102,7 +119,7 @@ func (store *MessageStore) Close() error {
 func (store *MessageStore) StoreChat(jid, name string, lastMessageTime time.Time) error {
 	_, err := store.db.Exec(
 		"INSERT OR REPLACE INTO chats (jid, name, last_message_time) VALUES (?, ?, ?)",
-		jid, name, lastMessageTime,
+		jid, name, lastMessageTime.UTC(),
 	)
 	return err
 }
@@ -119,7 +136,7 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		`INSERT OR REPLACE INTO messages 
 		(id, chat_jid, sender, content, timestamp, is_from_me, media_type, filename, url, media_key, file_sha256, file_enc_sha256, file_length) 
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		id, chatJID, sender, content, timestamp, isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
+		id, chatJID, sender, content, timestamp.UTC(), isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
 }
@@ -202,31 +219,21 @@ type SendMessageRequest struct {
 	MediaPath string `json:"media_path,omitempty"`
 }
 
+// parseRecipientJID resolves a phone number or JID string to a types.JID.
+func parseRecipientJID(recipient string) (types.JID, error) {
+	if strings.Contains(recipient, "@") {
+		return types.ParseJID(recipient)
+	}
+	return types.JID{
+		User:   recipient,
+		Server: "s.whatsapp.net", // For personal chats
+	}, nil
+}
+
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, logger waLog.Logger, recipientJID types.JID, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
-	}
-
-	// Create JID for recipient
-	var recipientJID types.JID
-	var err error
-
-	// Check if recipient is a JID
-	isJID := strings.Contains(recipient, "@")
-
-	if isJID {
-		// Parse the JID string
-		recipientJID, err = types.ParseJID(recipient)
-		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
-		}
-	} else {
-		// Create JID from phone number
-		recipientJID = types.JID{
-			User:   recipient,
-			Server: "s.whatsapp.net", // For personal chats
-		}
 	}
 
 	msg := &waProto.Message{}
@@ -362,13 +369,27 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	sendResp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
 	}
 
-	return true, fmt.Sprintf("Message sent to %s", recipient)
+	// Record the outbound message. The event handler never sees sends made
+	// through this client, so without this the store holds inbound traffic
+	// only and agents cannot see their own posts.
+	chatJID := recipientJID.String()
+	chatName := GetChatName(client, messageStore, recipientJID, chatJID, nil, "", logger)
+	if err := messageStore.StoreChat(chatJID, chatName, sendResp.Timestamp); err != nil {
+		logger.Warnf("Failed to store chat for outbound message: %v", err)
+	}
+	mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength := extractMediaInfo(msg, sendResp.ID)
+	if err := messageStore.StoreMessage(sendResp.ID, chatJID, client.Store.ID.User, message, sendResp.Timestamp, true,
+		mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength); err != nil {
+		logger.Warnf("Failed to store outbound message: %v", err)
+	}
+
+	return true, fmt.Sprintf("Message sent to %s", chatJID)
 }
 
 // Extract media info from a message
@@ -435,7 +456,7 @@ func extractMediaInfo(msg *waProto.Message, messageID string) (mediaType string,
 }
 
 // Handle regular incoming messages with media support
-func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *events.Message, logger waLog.Logger) {
+func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, cfg *BridgeConfig, msg *events.Message, logger waLog.Logger) {
 	// Save message to database
 	chatJID := msg.Info.Chat.String()
 	sender := msg.Info.Sender.User
@@ -494,6 +515,22 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+
+		// Push new messages to any configured hooks so consumers don't have
+		// to poll the store. Own-account messages sent from the phone arrive
+		// here with IsFromMe set and consumers want those too (e.g. the
+		// account owner posting in a watched group); REST-API sends never
+		// reach this handler, so there is no self-notification loop.
+		cfg.FireHooks(HookPayload{
+			ID:        msg.Info.ID,
+			ChatJID:   chatJID,
+			Sender:    sender,
+			Content:   content,
+			Timestamp: msg.Info.Timestamp.UTC().Format(time.RFC3339),
+			IsFromMe:  msg.Info.IsFromMe,
+			MediaType: mediaType,
+			Filename:  filename,
+		}, logger)
 	}
 }
 
@@ -703,7 +740,7 @@ func extractDirectPathFromURL(url string) string {
 }
 
 // Start a REST API server to expose the WhatsApp client functionality
-func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, cfg *BridgeConfig, logger waLog.Logger, port int) {
 	// Handler for sending messages
 	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
@@ -730,10 +767,26 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 			return
 		}
 
+		recipientJID, err := parseRecipientJID(req.Recipient)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Invalid recipient: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		// Server-side outbound filter for nominated chats; a persuaded or
+		// buggy agent cannot bypass a refusal made here.
+		if reason := cfg.CheckOutbound(recipientJID.String(), req.Message, req.MediaPath != ""); reason != "" {
+			logger.Warnf("Refused send to %s: %s", recipientJID.String(), reason)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(SendMessageResponse{Success: false, Message: reason})
+			return
+		}
+
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, logger, recipientJID, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -864,12 +917,20 @@ func main() {
 	}
 	defer messageStore.Close()
 
+	// Load hooks and send-filter config. A broken config is a hard error:
+	// starting without the send filter would silently remove a guardrail.
+	bridgeConfig, err := LoadBridgeConfig(logger)
+	if err != nil {
+		logger.Errorf("%v", err)
+		return
+	}
+
 	// Setup event handling for messages and history sync
 	client.AddEventHandler(func(evt interface{}) {
 		switch v := evt.(type) {
 		case *events.Message:
 			// Process regular messages
-			handleMessage(client, messageStore, v, logger)
+			handleMessage(client, messageStore, bridgeConfig, v, logger)
 
 		case *events.HistorySync:
 			// Process history sync events
@@ -936,7 +997,7 @@ func main() {
 	fmt.Println("\n✓ Connected to WhatsApp! Type 'help' for commands.")
 
 	// Start REST API server
-	startRESTServer(client, messageStore, 8080)
+	startRESTServer(client, messageStore, bridgeConfig, logger, 8080)
 
 	// Create a channel to keep the main goroutine alive
 	exitChan := make(chan os.Signal, 1)

@@ -23,6 +23,9 @@ from whatsapp import (
     get_message_context as whatsapp_get_message_context,
 )
 from whatsapp import (
+    get_messages_since as whatsapp_get_messages_since,
+)
+from whatsapp import (
     list_chats as whatsapp_list_chats,
 )
 from whatsapp import (
@@ -221,6 +224,24 @@ def get_message_context(
     """
     context = whatsapp_get_message_context(message_id, before, after)
     return _serialize(context)
+
+
+@mcp.tool()
+def get_messages_since(chat_jid: str, cursor: Optional[int] = None, limit: int = 100) -> Dict[str, Any]:
+    """Get messages from a chat newer than an opaque cursor, for reliable polling.
+
+    Returns {"messages": [...], "next_cursor": int, "has_more": bool}. Each
+    message carries a stable id and a UTC ISO-8601 timestamp. Persist
+    next_cursor between polls and pass it back as cursor; omit it on the
+    first call to start from the oldest stored message. A message can very
+    occasionally reappear after a re-sync, so dedupe by id.
+
+    Args:
+        chat_jid: The JID of the chat to read
+        cursor: Opaque cursor from a previous call's next_cursor (omit to start from the beginning)
+        limit: Maximum number of messages to return (default 100)
+    """
+    return _serialize(whatsapp_get_messages_since(chat_jid, cursor, limit))
 
 
 @mcp.tool()
