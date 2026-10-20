@@ -193,37 +193,45 @@ func (store *MessageStore) StoreEdit(editID, chatJID, sender, content string, ti
 	return n == 1, err
 }
 
-// editRefusal says why an edit of message editOf, arriving in chatJID from sender, must not be stored, or "".
-// Only a message's author can edit it, in the chat it was sent to; WhatsApp enforces that, and this checks it again
-// against what is stored. When the original is not stored (sent before the bridge ran), there is nothing to check
-// and the edit is kept.
-func (store *MessageStore) editRefusal(editOf, chatJID, sender string) (string, error) {
+// editRefusal says why an edit of message editOf, arriving in chatJID, must not be stored ("" when it may be), and
+// the sender to store it under. Only a message's author can edit it, in the chat it was sent to; WhatsApp enforces
+// that, and this checks it again against what is stored.
+//
+// The sender is one person under two addresses: whatsmeow gives the edit's Sender and, when it knows it, SenderAlt
+// (the same user in the other addressing form, phone number or @lid; types/message.go). The original may have been
+// stored under either form, so it matches when its stored sender is the edit's sender OR its SenderAlt (Mira's
+// KAN-2066 review M1: matching Sender alone dropped a genuine edit made under the other form). The edit is then
+// stored under the ORIGINAL's form, so the original and its edits carry one sender. An empty alt matches nothing.
+// When the original is not stored (sent before the bridge ran), there is nothing to check: the edit is kept under
+// its own sender.
+func (store *MessageStore) editRefusal(editOf, chatJID, sender, senderAlt string) (string, string, error) {
 	rows, err := store.db.Query("SELECT chat_jid, sender FROM messages WHERE id = ? AND edit_of IS NULL", editOf)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	defer rows.Close()
-	found, inChat := false, false
+	found, inChat, storeAs := false, false, sender
 	for rows.Next() {
 		var chat, from sql.NullString
 		if err := rows.Scan(&chat, &from); err != nil {
-			return "", err
+			return "", "", err
 		}
 		found = true
 		if chat.String == chatJID {
 			inChat = true
-			if from.String != sender {
-				return "the edit's sender is not the original message's sender", nil
+			if from.String != sender && (senderAlt == "" || from.String != senderAlt) {
+				return "the edit's sender is not the original message's sender", "", nil
 			}
+			storeAs = from.String
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return "", err
+		return "", "", err
 	}
 	if found && !inChat {
-		return "the original message is in another chat", nil
+		return "the original message is in another chat", "", nil
 	}
-	return "", nil
+	return "", storeAs, nil
 }
 
 // extractEdit reports whether msg (already unwrapped by whatsmeow, which sets IsEdit when it removed an
@@ -256,7 +264,7 @@ func recordEdit(messageStore *MessageStore, cfg *BridgeConfig, msg *events.Messa
 		logger.Infof("Skipping an edit with no original ID or no text (id %s)", msg.Info.ID)
 		return true
 	}
-	why, err := messageStore.editRefusal(editOf, chatJID, sender)
+	why, storeAs, err := messageStore.editRefusal(editOf, chatJID, sender, msg.Info.SenderAlt.User)
 	if err != nil {
 		logger.Warnf("Failed to check edit %s of %s: %v", msg.Info.ID, editOf, err)
 		return true
@@ -265,7 +273,7 @@ func recordEdit(messageStore *MessageStore, cfg *BridgeConfig, msg *events.Messa
 		logger.Warnf("Refusing edit %s of %s: %s", msg.Info.ID, editOf, why)
 		return true
 	}
-	stored, err := messageStore.StoreEdit(msg.Info.ID, chatJID, sender, content, msg.Info.Timestamp, msg.Info.IsFromMe, editOf)
+	stored, err := messageStore.StoreEdit(msg.Info.ID, chatJID, storeAs, content, msg.Info.Timestamp, msg.Info.IsFromMe, editOf)
 	if err != nil {
 		logger.Warnf("Failed to store edit %s of %s: %v", msg.Info.ID, editOf, err)
 		return true
@@ -273,12 +281,12 @@ func recordEdit(messageStore *MessageStore, cfg *BridgeConfig, msg *events.Messa
 	if !stored {
 		return true // already stored: a redelivery
 	}
-	fmt.Printf("[%s] edit of %s by %s: %s\n", msg.Info.Timestamp.Format("2006-01-02 15:04:05"), editOf, sender, content)
+	fmt.Printf("[%s] edit of %s by %s: %s\n", msg.Info.Timestamp.Format("2006-01-02 15:04:05"), editOf, storeAs, content)
 	if cfg != nil {
 		cfg.FireHooks(HookPayload{
 			ID:        msg.Info.ID,
 			ChatJID:   chatJID,
-			Sender:    sender,
+			Sender:    storeAs,
 			Content:   content,
 			Timestamp: msg.Info.Timestamp.UTC().Format(time.RFC3339),
 			IsFromMe:  msg.Info.IsFromMe,

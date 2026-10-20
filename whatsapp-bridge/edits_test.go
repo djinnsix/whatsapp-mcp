@@ -251,3 +251,66 @@ func TestTheHookPayloadNamesTheMessageAnEditEdits(t *testing.T) {
 		t.Fatalf("a message that is not an edit must not carry edit_of: %s", plain)
 	}
 }
+
+// ---- Mira's KAN-2066 review M1: one person, two addresses (phone number and @lid).
+
+const authorLID = "246000000000001"
+
+// editEventAs is editEvent with the edit's Sender and SenderAlt given as JIDs, as whatsmeow fills them
+// (types.MessageSource: Sender, and SenderAlt, the same user in the other addressing form).
+func editEventAs(editID, chat string, sender, senderAlt types.JID, text string) *events.Message {
+	evt := editEvent(editID, chat, sender.User, text, true, false)
+	evt.Info.Sender = sender
+	evt.Info.SenderAlt = senderAlt
+	return evt
+}
+
+func storeOriginalAs(t *testing.T, store *MessageStore, sender string) {
+	t.Helper()
+	if err := store.StoreMessage(originalID, editChat, sender, "first text", sentAt, false, "", "", "", nil, nil, nil, 0); err != nil {
+		t.Fatalf("store original: %v", err)
+	}
+}
+
+func TestAnEditUnderTheOtherAddressFormIsStoredUnderTheOriginalsSender(t *testing.T) {
+	phone := types.NewJID(author, types.DefaultUserServer)
+	lid := types.NewJID(authorLID, types.HiddenUserServer)
+	for _, c := range []struct {
+		name              string
+		stored            string
+		sender, senderAlt types.JID
+	}{
+		{"original under the phone form, edit under @lid", author, lid, phone},
+		{"original under @lid, edit under the phone form", authorLID, phone, lid},
+	} {
+		store := testStore(t)
+		storeOriginalAs(t, store, c.stored)
+		recordEdit(store, nil, editEventAs("EDIT-ALT", editChat, c.sender, c.senderAlt, fullText), waLog.Noop)
+		edit, ok := readRow(t, store, "EDIT-ALT", editChat)
+		if !ok {
+			t.Fatalf("%s: a genuine edit under the other address form was refused", c.name)
+		}
+		if edit.sender != c.stored {
+			t.Fatalf("%s: the edit must be stored under the original's sender %q, got %q", c.name, c.stored, edit.sender)
+		}
+	}
+}
+
+func TestCONTROL_anUnrelatedSenderAltDoesNotMakeAnEditTheAuthors(t *testing.T) {
+	store := testStore(t)
+	storeOriginalAs(t, store, author)
+	lid := types.NewJID(authorLID, types.HiddenUserServer)
+	recordEdit(store, nil, editEventAs("EDIT-UNRELATED", editChat, lid, types.NewJID(stranger, types.DefaultUserServer), "forged"), waLog.Noop)
+	if _, ok := readRow(t, store, "EDIT-UNRELATED", editChat); ok {
+		t.Fatalf("an edit whose Sender and SenderAlt are both someone else was stored")
+	}
+}
+
+func TestAnEmptySenderAltMatchesNoStoredSender(t *testing.T) {
+	store := testStore(t)
+	storeOriginalAs(t, store, "") // a row stored with no sender
+	recordEdit(store, nil, editEventAs("EDIT-NOALT", editChat, types.NewJID(stranger, types.DefaultUserServer), types.JID{}, "forged"), waLog.Noop)
+	if _, ok := readRow(t, store, "EDIT-NOALT", editChat); ok {
+		t.Fatalf("an empty SenderAlt matched an original stored with no sender")
+	}
+}
