@@ -53,8 +53,13 @@ func NewMessageStore() (*MessageStore, error) {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
-	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	return openMessageStore("file:store/messages.db?_foreign_keys=on")
+}
+
+// openMessageStore opens (and creates or migrates) the message store at dsn. Split from NewMessageStore so tests
+// can open a throwaway database; the bridge itself always uses store/messages.db.
+func openMessageStore(dsn string) (*MessageStore, error) {
+	db, err := sql.Open("sqlite3", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -107,7 +112,38 @@ func NewMessageStore() (*MessageStore, error) {
 		}
 	}
 
+	// Message edits (KAN-2066): each edit is its own row, under the edit's own message ID, with edit_of naming
+	// the message it edits. Added once to a store created before; a no-op after that.
+	if err := addColumnIfMissing(db, "messages", "edit_of", "TEXT"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to add messages.edit_of: %v", err)
+	}
+
 	return &MessageStore{db: db}, nil
+}
+
+// addColumnIfMissing adds column to table unless table already has it (SQLite has no ADD COLUMN IF NOT EXISTS).
+func addColumnIfMissing(db *sql.DB, table, column, columnType string) error {
+	rows, err := db.Query(fmt.Sprintf("SELECT name FROM pragma_table_info('%s')", table))
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return err
+		}
+		if name == column {
+			return nil
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	rows.Close()
+	_, err = db.Exec(fmt.Sprintf("ALTER TABLE %s ADD COLUMN %s %s", table, column, columnType))
+	return err
 }
 
 // Close the database connection
@@ -139,6 +175,117 @@ func (store *MessageStore) StoreMessage(id, chatJID, sender, content string, tim
 		id, chatJID, sender, content, timestamp.UTC(), isFromMe, mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength,
 	)
 	return err
+}
+
+// StoreEdit records one edit of message editOf as a row of its own, under the edit's own ID (editID), so the
+// original row is never changed. INSERT OR IGNORE: a redelivered edit keeps its first row (and rowid), so a
+// consumer reading by rowid sees it once. Returns whether a row was written.
+func (store *MessageStore) StoreEdit(editID, chatJID, sender, content string, timestamp time.Time, isFromMe bool, editOf string) (bool, error) {
+	result, err := store.db.Exec(
+		`INSERT OR IGNORE INTO messages (id, chat_jid, sender, content, timestamp, is_from_me, edit_of)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`,
+		editID, chatJID, sender, content, timestamp.UTC(), isFromMe, editOf,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	return n == 1, err
+}
+
+// editRefusal says why an edit of message editOf, arriving in chatJID from sender, must not be stored, or "".
+// Only a message's author can edit it, in the chat it was sent to; WhatsApp enforces that, and this checks it again
+// against what is stored. When the original is not stored (sent before the bridge ran), there is nothing to check
+// and the edit is kept.
+func (store *MessageStore) editRefusal(editOf, chatJID, sender string) (string, error) {
+	rows, err := store.db.Query("SELECT chat_jid, sender FROM messages WHERE id = ? AND edit_of IS NULL", editOf)
+	if err != nil {
+		return "", err
+	}
+	defer rows.Close()
+	found, inChat := false, false
+	for rows.Next() {
+		var chat, from sql.NullString
+		if err := rows.Scan(&chat, &from); err != nil {
+			return "", err
+		}
+		found = true
+		if chat.String == chatJID {
+			inChat = true
+			if from.String != sender {
+				return "the edit's sender is not the original message's sender", nil
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return "", err
+	}
+	if found && !inChat {
+		return "the original message is in another chat", nil
+	}
+	return "", nil
+}
+
+// extractEdit reports whether msg (already unwrapped by whatsmeow, which sets IsEdit when it removed an
+// EditedMessage wrapper) is an edit, and if so the ID of the message it edits and its new text.
+//
+// KAN-2066. An edit is a ProtocolMessage of type MESSAGE_EDIT whose key names the original and whose
+// editedMessage is the new content, whether or not it came inside an EditedMessage wrapper. NOT handled, by
+// design: edits replayed by a history sync (stored as WhatsApp sends them), deletes and revokes (other
+// ProtocolMessage types), and an edit with no text (such as a media caption-only change), which is skipped like
+// an empty message.
+func extractEdit(msg *waProto.Message) (editOf string, content string, isEdit bool) {
+	pm := msg.GetProtocolMessage()
+	if pm == nil || pm.GetType() != waProto.ProtocolMessage_MESSAGE_EDIT {
+		return "", "", false
+	}
+	return pm.GetKey().GetID(), extractTextContent(pm.GetEditedMessage()), true
+}
+
+// recordEdit stores msg when it is an edit and returns true; it returns false for anything else, which the
+// caller handles as before. An edit is stored only with an original ID and some text, and only when editRefusal
+// finds nothing wrong. The same hooks fire as for a new message, with EditOf set.
+func recordEdit(messageStore *MessageStore, cfg *BridgeConfig, msg *events.Message, logger waLog.Logger) bool {
+	editOf, content, isEdit := extractEdit(msg.Message)
+	if !isEdit {
+		return false
+	}
+	chatJID := msg.Info.Chat.String()
+	sender := msg.Info.Sender.User
+	if editOf == "" || content == "" {
+		logger.Infof("Skipping an edit with no original ID or no text (id %s)", msg.Info.ID)
+		return true
+	}
+	why, err := messageStore.editRefusal(editOf, chatJID, sender)
+	if err != nil {
+		logger.Warnf("Failed to check edit %s of %s: %v", msg.Info.ID, editOf, err)
+		return true
+	}
+	if why != "" {
+		logger.Warnf("Refusing edit %s of %s: %s", msg.Info.ID, editOf, why)
+		return true
+	}
+	stored, err := messageStore.StoreEdit(msg.Info.ID, chatJID, sender, content, msg.Info.Timestamp, msg.Info.IsFromMe, editOf)
+	if err != nil {
+		logger.Warnf("Failed to store edit %s of %s: %v", msg.Info.ID, editOf, err)
+		return true
+	}
+	if !stored {
+		return true // already stored: a redelivery
+	}
+	fmt.Printf("[%s] edit of %s by %s: %s\n", msg.Info.Timestamp.Format("2006-01-02 15:04:05"), editOf, sender, content)
+	if cfg != nil {
+		cfg.FireHooks(HookPayload{
+			ID:        msg.Info.ID,
+			ChatJID:   chatJID,
+			Sender:    sender,
+			Content:   content,
+			Timestamp: msg.Info.Timestamp.UTC().Format(time.RFC3339),
+			IsFromMe:  msg.Info.IsFromMe,
+			EditOf:    editOf,
+		}, logger)
+	}
+	return true
 }
 
 // Get messages from a chat
@@ -468,6 +615,11 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, cfg *Br
 	err := messageStore.StoreChat(chatJID, name, msg.Info.Timestamp)
 	if err != nil {
 		logger.Warnf("Failed to store chat: %v", err)
+	}
+
+	// An edit is stored as a row of its own linked to the original (KAN-2066), never as a new plain message.
+	if recordEdit(messageStore, cfg, msg, logger) {
+		return
 	}
 
 	// Extract text content

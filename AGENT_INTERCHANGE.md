@@ -24,6 +24,12 @@ The bridge can push new inbound messages instead of making consumers poll. Confi
 
 Webhooks receive it as a POST body; commands receive it on stdin.
 
+**Edits.** An edited message is stored as a message of its own, under the edit's own id, with the new text, and
+`messages.edit_of` naming the message it edits; the original row is never changed. Its hook payload carries
+`"edit_of": "<original id>"` (absent for a message that is not an edit). An edit is stored only when, if the original
+is stored, it comes from the same sender in the same chat. Not handled as edits: edits replayed by a history sync,
+deletes and revokes, and an edit with no text (such as a changed media caption).
+
 ## 4. Server-side send filter
 
 For nominated chat JIDs the REST send handler runs a pattern list over the outgoing text and refuses the send with HTTP 403 and the reason on a match. Enforcement lives in the bridge, so an agent cannot be talked into bypassing it. Media sends to filtered chats are refused too unless `allow_media` is set, because file contents cannot be scanned.
