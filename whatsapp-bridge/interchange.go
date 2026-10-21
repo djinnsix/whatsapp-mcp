@@ -137,6 +137,8 @@ type HookPayload struct {
 	IsFromMe  bool   `json:"is_from_me"`
 	MediaType string `json:"media_type,omitempty"`
 	Filename  string `json:"filename,omitempty"`
+	// EditOf is set when this message is an edit: the ID of the message it edits (KAN-2066).
+	EditOf string `json:"edit_of,omitempty"`
 }
 
 var hookHTTPClient = &http.Client{Timeout: 5 * time.Second}
