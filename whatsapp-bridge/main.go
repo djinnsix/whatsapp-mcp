@@ -892,8 +892,8 @@ func extractDirectPathFromURL(url string) string {
 
 	pathPart := parts[1]
 
-	// Remove query parameters
-	pathPart = strings.SplitN(pathPart, "?", 2)[0]
+	// Keep the query parameters: oh= and oe= sign the request, and the CDN
+	// refuses a direct path without them (403).
 
 	// Create proper direct path format
 	return "/" + pathPart
